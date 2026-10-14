@@ -1,0 +1,5 @@
+interface:
+  display_name: "Delegate Spec"
+  short_description: "Implement a spec's tickets through external agent CLIs (cursor-agent, pi); this session only orchestrates."
+policy:
+  allow_implicit_invocation: false
