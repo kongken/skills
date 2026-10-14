@@ -35,6 +35,9 @@ def do_work(cwd):
             fh.write("dirty\n")
     elif mode == "merge":
         git("merge", "--no-edit", os.environ["FAKE_MERGE_REF"], cwd=cwd)
+    if os.environ.get("FAKE_UNTRACKED"):
+        with open(os.path.join(cwd, "scratch.tmp"), "w") as fh:
+            fh.write("scratch\n")
     status = "blocked" if mode == "blocked" else "done"
     return mode, "I did the thing.\n" + json.dumps({"status": status, "summary": "fake " + mode})
 '''

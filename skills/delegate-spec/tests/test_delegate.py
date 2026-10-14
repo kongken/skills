@@ -89,6 +89,16 @@ class InitAndDispatch(Harness):
         self.assertEqual(self.sh("git", "rev-parse", "--abbrev-ref", "HEAD", cwd=wt), "delegate/spec-1/integration")
         self.assertTrue((self.tmp / "state/guard.py").is_file())
 
+    def test_init_rejects_existing_integration_branch_before_creating_state(self):
+        self.init()
+        self.dispatch()
+        self.delegate("verify", "--run", self.run_id, "--ticket", "1")
+        self.delegate("land", "--run", self.run_id, "--ticket", "1")
+        self.delegate("finish", "--run", self.run_id)
+        refused = self.delegate("init", "--name", "spec-1", "--base", "main", expect_ok=False)
+        self.assertEqual(refused["outcome"], "branch_exists")
+        self.assertEqual(len(self.delegate("runs")["runs"]), 1)
+
     def test_pi_dispatch_done_records_ledger(self):
         self.init()
         out = self.dispatch()
@@ -102,6 +112,29 @@ class InitAndDispatch(Harness):
             self.assertIn(flag, argv)
         self.assertTrue(argv[-1].startswith("/skill:delegate-tdd "))
         self.assertIn("Refs #1", argv[-1])
+
+    def test_dispatch_returns_sparse_summary_with_full_diagnostics_on_disk(self):
+        self.init()
+        out = self.dispatch()
+        self.assertNotIn("final_text_tail", out)
+        self.assertNotIn("cli", out)
+        self.assertEqual(out["report"]["status"], "done")
+        full = json.loads((Path(out["attempt_dir"]) / "result.json").read_text())
+        self.assertIn("final_text_tail", full)
+        self.assertTrue(full["cli"]["ok"])
+        verbose = self.dispatch("1", "--followup", "--verbose", FAKE_FILE="more.txt")
+        self.assertIn("final_text_tail", verbose)
+        self.assertTrue(verbose["cli"]["ok"])
+
+    def test_status_hides_snapshots_unless_verbose_without_changing_state(self):
+        self.init()
+        self.dispatch()
+        compact = self.delegate("status", "--run", self.run_id)
+        self.assertNotIn("integration_snapshot", compact)
+        self.assertNotIn("snapshot", compact["tickets"]["1"])
+        full = self.delegate("status", "--run", self.run_id, "--verbose")
+        self.assertIn("integration_snapshot", full)
+        self.assertIn("snapshot", full["tickets"]["1"])
 
     def test_pi_inherit_profile_keeps_user_extensions(self):
         self.init()
@@ -164,6 +197,12 @@ class InitAndDispatch(Harness):
         self.assertEqual(out["stopped"], "after_done")
         self.assertLess(out["elapsed_seconds"], 30)
 
+    def test_untracked_files_make_dispatch_dirty(self):
+        self.init()
+        out = self.dispatch(expect_ok=False, FAKE_UNTRACKED="1")
+        self.assertEqual(out["outcome"], "dirty")
+        self.assertEqual(out["untracked"], ["scratch.tmp"])
+
     def test_followup_requires_previous_session(self):
         self.init()
         out = self.dispatch("1", "--followup", expect_ok=False)
@@ -171,6 +210,29 @@ class InitAndDispatch(Harness):
 
 
 class LandAndAudit(Harness):
+    def test_land_requires_successful_verification_of_current_head(self):
+        self.init()
+        self.dispatch()
+        refused = self.delegate("land", "--run", self.run_id, "--ticket", "1", expect_ok=False)
+        self.assertEqual(refused["outcome"], "not_verified")
+        self.delegate("verify", "--run", self.run_id, "--ticket", "1")
+        self.dispatch("1", "--followup", FAKE_FILE="more.txt")
+        refused = self.delegate("land", "--run", self.run_id, "--ticket", "1", expect_ok=False)
+        self.assertEqual(refused["outcome"], "not_verified")
+        self.delegate("verify", "--run", self.run_id, "--ticket", "1", "--cmd", "false", expect_ok=False)
+        refused = self.delegate("land", "--run", self.run_id, "--ticket", "1", expect_ok=False)
+        self.assertEqual(refused["outcome"], "not_verified")
+        self.delegate("verify", "--run", self.run_id, "--ticket", "1")
+        self.assertEqual(self.delegate("land", "--run", self.run_id, "--ticket", "1")["outcome"], "landed")
+
+    def test_failed_verification_invalidates_previous_success_at_same_head(self):
+        self.init()
+        self.dispatch()
+        self.delegate("verify", "--run", self.run_id, "--ticket", "1")
+        self.delegate("verify", "--run", self.run_id, "--ticket", "1", "--cmd", "false", expect_ok=False)
+        refused = self.delegate("land", "--run", self.run_id, "--ticket", "1", expect_ok=False)
+        self.assertEqual(refused["outcome"], "not_verified")
+
     def test_land_verify_audit_finish(self):
         self.init()
         self.dispatch("1")
@@ -188,6 +250,7 @@ class LandAndAudit(Harness):
         self.init()
         self.dispatch("1")
         self.dispatch("2", FAKE_FILE="two.txt")
+        self.delegate("verify", "--run", self.run_id, "--ticket", "1")
         self.delegate("land", "--run", self.run_id, "--ticket", "1")
         out = self.delegate("land", "--run", self.run_id, "--ticket", "2", expect_ok=False)
         self.assertEqual(out["outcome"], "needs_merge")
@@ -195,8 +258,39 @@ class LandAndAudit(Harness):
                                FAKE_MERGE_REF="delegate/spec-1/integration")
         self.assertEqual(merged["outcome"], "done")
         self.assertEqual(len(merged["commits"]), 1, "only the merge commit is ticket 2's own")
+        self.delegate("verify", "--run", self.run_id, "--ticket", "2")
         self.assertEqual(self.delegate("land", "--run", self.run_id, "--ticket", "2")["outcome"], "landed")
         self.assertEqual(self.delegate("audit", "--run", self.run_id)["commits"], 3)
+
+    def test_importing_an_unlanded_ticket_preserves_ownership_and_blocks_landing(self):
+        self.init()
+        other = self.dispatch("2", FAKE_FILE="two.txt")
+        imported = self.dispatch("1", expect_ok=False, FAKE_MODE="merge", FAKE_MERGE_REF="delegate/spec-1/2")
+        self.assertEqual(imported["outcome"], "foreign_commits")
+        self.assertEqual(imported["commits"], [])
+        self.assertEqual(imported["foreign_commits"], other["commits"])
+        self.delegate("verify", "--run", self.run_id, "--ticket", "1")
+        refused = self.delegate("land", "--run", self.run_id, "--ticket", "1", expect_ok=False)
+        self.assertEqual(refused["outcome"], "foreign_commits")
+        self.delegate("verify", "--run", self.run_id, "--ticket", "2")
+        self.delegate("land", "--run", self.run_id, "--ticket", "2")
+        self.assertEqual(self.delegate("audit", "--run", self.run_id)["by_agent_ticket"], {"pi:2": other["commits"]})
+
+    def test_imported_unrelated_history_is_not_added_to_ledger(self):
+        self.sh("git", "switch", "-q", "-c", "unrelated")
+        (self.repo / "unrelated.txt").write_text("existing work\n")
+        self.sh("git", "add", "unrelated.txt")
+        self.sh("git", "commit", "-q", "-m", "unrelated")
+        sha = self.sh("git", "rev-parse", "HEAD")
+        self.sh("git", "switch", "-q", "main")
+        self.init()
+        out = self.dispatch(expect_ok=False, FAKE_MODE="merge", FAKE_MERGE_REF="unrelated")
+        self.assertEqual(out["outcome"], "foreign_commits")
+        self.assertEqual(out["commits"], [])
+        self.assertEqual(out["foreign_commits"], [sha])
+        self.delegate("verify", "--run", self.run_id, "--ticket", "1")
+        refused = self.delegate("land", "--run", self.run_id, "--ticket", "1", expect_ok=False)
+        self.assertEqual(refused["outcome"], "unaudited_commits")
 
     def test_land_refuses_commit_not_made_by_an_agent(self):
         self.init()
@@ -209,6 +303,7 @@ class LandAndAudit(Harness):
         self.assertEqual(refused["outcome"], "tampered")
         restored = self.delegate("restore", "--run", self.run_id, "--ticket", "1")
         self.assertEqual(restored["reset_to"], out["head_after"])
+        self.delegate("verify", "--run", self.run_id, "--ticket", "1")
         landed = self.delegate("land", "--run", self.run_id, "--ticket", "1")
         self.assertEqual(landed["commits"], out["commits"])
 
@@ -223,6 +318,40 @@ class LandAndAudit(Harness):
         self.delegate("restore", "--run", self.run_id, "--ticket", "1")
         self.assertFalse((Path(out["worktree"]) / "by_hand.py").exists())
         self.assertEqual(self.dispatch("1", "--followup", FAKE_FILE="more.txt")["outcome"], "done")
+
+    def test_content_edit_to_already_dirty_file_is_tampering(self):
+        self.init()
+        out = self.dispatch(expect_ok=False, FAKE_MODE="dirty")
+        wt = Path(out["worktree"])
+        before = self.sh("git", "status", "--porcelain", cwd=wt)
+        (wt / "README.md").write_text("manual edit\n")
+        self.assertEqual(before, self.sh("git", "status", "--porcelain", cwd=wt))
+        refused = self.dispatch("1", "--followup", expect_ok=False)
+        self.assertEqual(refused["outcome"], "tampered")
+
+    def test_non_utf8_content_can_be_fingerprinted(self):
+        self.init()
+        out = self.dispatch()
+        self.delegate("verify", "--run", self.run_id, "--ticket", "1", "--cmd", "printf '\\377\\n' > README.md")
+        (Path(out["worktree"]) / "README.md").write_bytes(b"\xfe\n")
+        refused = self.delegate("verify", "--run", self.run_id, "--ticket", "1", expect_ok=False)
+        self.assertEqual(refused["outcome"], "tampered")
+
+    def test_whitespace_only_content_tampering_is_detected(self):
+        self.init()
+        out = self.dispatch()
+        self.delegate("verify", "--run", self.run_id, "--ticket", "1", "--cmd", "printf 'hello\\n \\n' > README.md")
+        (Path(out["worktree"]) / "README.md").write_bytes(b"hello\n  \n")
+        refused = self.delegate("verify", "--run", self.run_id, "--ticket", "1", expect_ok=False)
+        self.assertEqual(refused["outcome"], "tampered")
+
+    def test_content_edit_to_existing_untracked_file_is_tampering(self):
+        self.init()
+        out = self.dispatch()
+        self.delegate("verify", "--run", self.run_id, "--ticket", "1", "--cmd", "touch artifact.txt")
+        (Path(out["worktree"]) / "artifact.txt").write_text("manual edit\n")
+        refused = self.delegate("verify", "--run", self.run_id, "--ticket", "1", expect_ok=False)
+        self.assertEqual(refused["outcome"], "tampered")
 
     def test_verify_output_does_not_count_as_tampering(self):
         self.init()
@@ -302,6 +431,19 @@ class Guard(Harness):
         self.assertEqual(self.guard("Bash", {"command": "git commit -am x"}), "allow")
         self.delegate("finish", "--run", self.run_id, "--abort")
         self.assertEqual(self.guard("Edit", {"file_path": str(wt / "a.go")}), "allow")
+
+    def test_runner_name_does_not_exempt_shell_writes(self):
+        wt = Path(self.init()["integration_worktree"])
+        commands = [
+            f"touch {wt}/x # delegate.py",
+            f"echo delegate.py > {wt}/x",
+            f"python3 {DELEGATE} status --run {self.run_id}; touch {wt}/x",
+            f"python3 {DELEGATE} status --run {self.run_id} && git -C {wt} commit -am x",
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertEqual(self.guard("Bash", {"command": command}), "deny")
+        self.assertEqual(self.guard("Bash", {"command": f"python3 {DELEGATE} land --run x"}, cwd=wt), "allow")
 
     def test_guard_allows_everything_without_runs(self):
         self.assertEqual(self.guard("Write", {"file_path": str(self.repo / "x")}), "allow")

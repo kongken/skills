@@ -8,7 +8,8 @@ delegate-spec skill has been invoked. While any run is active, it denies:
 - Bash commands that look like they write, when they run in or point at that root.
 
 Every code change in a run must come from an external agent (`delegate.py dispatch`).
-This guard is best-effort for Bash; `delegate.py audit` is the backstop.
+This guard is best-effort for Bash; runner fingerprints and provenance checks
+are the backstop for workflow mistakes, not a sandbox against malicious agents.
 
 `delegate.py init` copies this file to <state root>/guard.py so the hook command
 can find it without knowing where the skill is installed. Stdlib only. Fails open:
@@ -34,8 +35,6 @@ WRITE_PATTERNS = [
     r"\b(tee|cp|mv|rm|rmdir|touch|mkdir|ln|chmod|truncate|install|patch|dd)\b",
     r"\b(python3?|node|ruby|perl)\s+-[ce]\b",
 ]
-
-RUNNER_MARK = "delegate.py"
 
 
 def state_root() -> Path:
@@ -94,7 +93,7 @@ def check_file_tool(tool_input, cwd, roots):
 
 def check_bash(tool_input, cwd, roots):
     command = tool_input.get("command") or ""
-    if not command or RUNNER_MARK in command:
+    if not command:
         return None
     if not any(re.search(p, command) for p in WRITE_PATTERNS):
         return None

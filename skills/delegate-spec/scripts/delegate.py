@@ -21,6 +21,7 @@ See ../references/runner.md for the full contract.
 """
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import queue
@@ -31,6 +32,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -96,17 +98,18 @@ def slugify(value: str) -> str:
     return slug
 
 
-def run_cmd(args, cwd=None, env=None, timeout=120, check=True):
+def run_cmd(args, cwd=None, env=None, timeout=120, check=True, text=True):
     try:
         proc = subprocess.run(args, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
-                              capture_output=True, text=True, timeout=timeout)
+                              capture_output=True, text=text, timeout=timeout)
     except FileNotFoundError:
         raise Fail(f"command not found: {args[0]}")
     except subprocess.TimeoutExpired:
         raise Fail(f"command timed out after {timeout}s: {' '.join(map(str, args))}")
     if check and proc.returncode != 0:
+        stderr = proc.stderr if text else proc.stderr.decode("utf-8", "replace")
         raise Fail(f"command failed ({proc.returncode}): {' '.join(map(str, args))}",
-                   stderr=proc.stderr.strip()[-2000:])
+                   stderr=stderr.strip()[-2000:])
     return proc
 
 
@@ -215,14 +218,22 @@ def ledger_commits(rdir: Path) -> dict:
             if line.strip():
                 entry = json.loads(line)
                 for sha in entry.get("commits", []):
-                    owners[sha] = entry
+                    owners.setdefault(sha, entry)
     return owners
 
 
-def append_ledger(rdir: Path, entry: dict):
+def append_ledger(rdir: Path, entry: dict, preexisting: set):
+    """Keep first ownership; importing an existing commit is not authorship."""
     with locked(rdir):
-        with open(rdir / "ledger.jsonl", "a") as fh:
-            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        owners = ledger_commits(rdir)
+        foreign = [sha for sha in entry["commits"]
+                   if (sha in preexisting or sha in owners)
+                   and owners.get(sha, {}).get("ticket") != entry["ticket"]]
+        entry["commits"] = [sha for sha in entry["commits"] if sha not in preexisting and sha not in owners]
+        if entry["commits"]:
+            with open(rdir / "ledger.jsonl", "a") as fh:
+                fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        return entry["commits"], foreign
 
 
 def pid_alive(pid) -> bool:
@@ -546,9 +557,27 @@ def classify(stopped, cli, rewritten, report, dirty, commits):
 
 
 def snapshot(wt):
-    """What a worktree looks like right now: HEAD plus every changed or untracked path."""
+    """Fingerprint HEAD, index, tracked edits and non-ignored untracked contents."""
+    digest = hashlib.sha256()
+    for flags in ([], ["--cached"]):
+        diff = run_cmd(["git", "diff", "--no-ext-diff", "--no-textconv", "--binary", *flags],
+                       cwd=wt, text=False).stdout
+        digest.update(diff)
+        digest.update(b"\0")
+    paths = run_cmd(["git", "ls-files", "--others", "--exclude-standard", "-z"], cwd=wt, text=False).stdout
+    for name in sorted(p for p in paths.split(b"\0") if p):
+        path = Path(wt) / os.fsdecode(name)
+        digest.update(name + b"\0" + str(path.lstat().st_mode).encode() + b"\0")
+        if path.is_symlink():
+            digest.update(os.fsencode(os.readlink(path)))
+        elif path.is_file():
+            with path.open("rb") as fh:
+                for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        digest.update(b"\0")
     return {"head": git(["rev-parse", "HEAD"], wt),
-            "status": git(["status", "--porcelain", "--untracked-files=all"], wt)}
+            "status": git(["status", "--porcelain", "--untracked-files=all"], wt),
+            "contents": digest.hexdigest()}
 
 
 def check_untouched(wt, recorded, what):
@@ -632,17 +661,15 @@ def cmd_init(args):
     base_sha = git(["rev-parse", "--verify", f"{base}^{{commit}}"], repo)
     prefix = cfg["branch_prefix"]
     integration = args.integration_branch or f"{prefix}{slug}/integration"
-    run_id = f"{slug}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    if git_ok(["show-ref", "--verify", "--quiet", f"refs/heads/{integration}"], repo):
+        raise Fail("integration branch already exists; resume its run or choose another name/branch",
+                   outcome="branch_exists", branch=integration)
+    run_id = f"{slug}-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
     rdir = state_root() / "runs" / run_id
     wt_root = rdir / "wt"
     wt_root.mkdir(parents=True)
     integ_wt = wt_root / "_integration"
-    if git_ok(["show-ref", "--verify", "--quiet", f"refs/heads/{integration}"], repo):
-        git(["worktree", "add", str(integ_wt), integration], repo)
-        reused = True
-    else:
-        git(["worktree", "add", "-b", integration, str(integ_wt), base_sha], repo)
-        reused = False
+    git(["worktree", "add", "-b", integration, str(integ_wt), base_sha], repo)
     for sub in ("briefs", "notes", "tickets", "verify"):
         (rdir / sub).mkdir()
     run = {
@@ -659,7 +686,7 @@ def cmd_init(args):
     return {"ok": True, "run_id": run_id, "run_dir": str(rdir), "briefs_dir": str(rdir / "briefs"),
             "notes_dir": str(rdir / "notes"), "integration_branch": integration,
             "integration_worktree": str(integ_wt), "base": base, "base_sha": base_sha,
-            "reused_integration_branch": reused,
+            "reused_integration_branch": False,
             "warnings": [f"another active run on this repo: {r['run_id']}" for r in others]}
 
 
@@ -727,6 +754,7 @@ def cmd_dispatch(args):
         if args.followup:
             if ticket.get("agent") != agent or not ticket.get("session"):
                 raise Fail("--followup needs an earlier dispatch of this ticket with the same agent")
+        ticket["verified_head"] = None
         ticket["attempts"] += 1
         attempt = ticket["attempts"]
         running[tslug] = {"pid": os.getpid(), "started_at": now_iso(), "agent": agent}
@@ -758,6 +786,7 @@ def _dispatch(rdir, run, tslug, ticket, agent, settings, attempt, brief, followu
         prompt = f"{adapter.skill_prefix}{brief}\n\n{rules}"
     (adir / "prompt.md").write_text(prompt)
     head_before = git(["rev-parse", "HEAD"], wt)
+    preexisting = set(git(["rev-list", "--all"], wt).split())
     cmd = adapter.command(settings, wt, rdir, session, prompt)
     (adir / "command.json").write_text(json.dumps(cmd[:-1] + ["<prompt.md>"], indent=2))
     parser = adapter.parser()
@@ -774,12 +803,14 @@ def _dispatch(rdir, run, tslug, ticket, agent, settings, attempt, brief, followu
                   wt).split() if head_after != head_before else []
     tracked, untracked = worktree_changes(wt)
     report = extract_report(cli.get("final_text"))
-    outcome = classify(stopped, cli, rewritten, report, tracked, commits)
     session = cli.get("session_id") or session
-    if commits:
-        append_ledger(rdir, {"ticket": tslug, "attempt": attempt, "agent": agent, "session": session,
-                             "head_before": head_before, "head_after": head_after,
-                             "commits": commits, "at": now_iso()})
+    commits, foreign = append_ledger(rdir, {
+        "ticket": tslug, "attempt": attempt, "agent": agent, "session": session,
+        "head_before": head_before, "head_after": head_after, "commits": commits, "at": now_iso(),
+    }, preexisting)
+    outcome = classify(stopped, cli, rewritten, report, tracked or untracked, commits)
+    if foreign:
+        outcome = "foreign_commits"
     stderr_tail = (adir / "stderr.log").read_text(errors="replace")[-1500:]
     result = {
         "ok": outcome == "done", "outcome": outcome, "ticket": tslug, "attempt": attempt,
@@ -788,7 +819,7 @@ def _dispatch(rdir, run, tslug, ticket, agent, settings, attempt, brief, followu
         "exit_code": exit_code, "stopped": stopped, "elapsed_seconds": round(elapsed, 1),
         "cli": {k: v for k, v in cli.items() if k != "final_text"},
         "report": report, "final_text_tail": (cli.get("final_text") or "")[-1500:],
-        "commits": commits, "head_before": head_before, "head_after": head_after,
+        "commits": commits, "foreign_commits": foreign, "head_before": head_before, "head_after": head_after,
         "uncommitted_tracked": tracked, "untracked": untracked[:50],
         "stderr_tail": stderr_tail if outcome == "cli_failed" else stderr_tail[-300:],
         "attempt_dir": str(adir),
@@ -839,7 +870,9 @@ def cmd_verify(args):
         if target == "integration":
             run["integration_snapshot"] = snapshot(wt)
         else:
-            run["tickets"][target]["snapshot"] = snapshot(wt)
+            ticket = run["tickets"][target]
+            ticket["snapshot"] = snapshot(wt)
+            ticket["verified_head"] = ticket["snapshot"]["head"] if ok else None
     return {"ok": ok, "target": target, "worktree": wt, "results": results}
 
 
@@ -868,10 +901,16 @@ def cmd_land(args):
         if unaudited:
             raise Fail("refusing to land commits that no agent run produced", outcome="unaudited_commits",
                        unaudited=unaudited)
+        foreign = [sha for sha in pending if owners[sha]["ticket"] != tslug]
+        if foreign:
+            raise Fail("another ticket's work must land through that ticket first",
+                       outcome="foreign_commits", foreign_commits=foreign)
         if not git_ok(["merge-base", "--is-ancestor", integration, ticket["branch"]], integ_wt):
             return {"ok": False, "outcome": "needs_merge", "ticket": tslug,
                     "hint": f"follow up with the agent: merge `{integration}` into `{ticket['branch']}`, "
                             "resolve conflicts, run the tests, commit"}
+        if ticket.get("verified_head") != git(["rev-parse", ticket["branch"]], integ_wt):
+            raise Fail("verify this ticket's current head before landing", outcome="not_verified")
         git(["merge", "--ff-only", ticket["branch"]], integ_wt)
         run["integration_snapshot"] = snapshot(integ_wt)
         head = git(["rev-parse", "HEAD"], integ_wt)
@@ -898,6 +937,7 @@ def cmd_restore(args):
         after = snapshot(wt)
         if args.ticket:
             ticket["snapshot"] = after
+            ticket["verified_head"] = None
         else:
             run["integration_snapshot"] = after
         return {"ok": True, "worktree": wt, "reset_to": head, "discarded": before}
@@ -1070,6 +1110,8 @@ def build_parser():
     s.add_argument("--abort", action="store_true", help="mark finished without cleaning up")
     s.add_argument("--delete-branches", action="store_true", help="delete landed ticket branches")
     s.set_defaults(func=cmd_finish)
+    for command in sub.choices.values():
+        command.add_argument("--verbose", action="store_true", help="include full diagnostics inline")
     return p
 
 
@@ -1081,7 +1123,19 @@ def main(argv=None):
         out = args.func(args)
     except Fail as exc:
         out = {"ok": False, "error": str(exc), **exc.extra}
-    print(json.dumps(out, indent=2, ensure_ascii=False))
+    if not args.verbose:
+        if args.command == "dispatch" and "attempt_dir" in out:
+            omit = {"final_text_tail"}
+            if out.get("ok"):
+                omit.update({"cli", "head_before", "exit_code", "branch", "model", "profile", "followup",
+                             "stderr_tail", "foreign_commits", "uncommitted_tracked", "untracked"})
+            out = {key: value for key, value in out.items() if key not in omit}
+        elif args.command == "status" and out.get("ok"):
+            out.pop("integration_snapshot", None)
+            for ticket in out["tickets"].values():
+                ticket.pop("snapshot", None)
+    print(json.dumps(out, indent=2 if args.verbose else None,
+                     separators=None if args.verbose else (",", ":"), ensure_ascii=False))
     return 0 if out.get("ok") else 1
 
 
